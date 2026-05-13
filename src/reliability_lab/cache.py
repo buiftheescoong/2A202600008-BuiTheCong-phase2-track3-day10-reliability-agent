@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 import time
 from dataclasses import dataclass
+from threading import RLock
 from typing import Any
 
 # ---------------------------------------------------------------------------
@@ -11,9 +13,24 @@ from typing import Any
 # ---------------------------------------------------------------------------
 
 PRIVACY_PATTERNS = re.compile(
-    r"\b(balance|password|credit.card|ssn|social.security|user.\d+|account.\d+)\b",
+    r"\b(balance|password|credit.card|ssn|social.security|user\s*\d+|account\s*\d+)\b",
     re.IGNORECASE,
 )
+
+TOKEN_PATTERN = re.compile(r"[a-z0-9]+", re.IGNORECASE)
+STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "for",
+    "in",
+    "me",
+    "of",
+    "the",
+    "to",
+    "what",
+    "when",
+}
 
 
 def _is_uncacheable(query: str) -> bool:
@@ -53,23 +70,36 @@ class ResponseCache:
         self.ttl_seconds = ttl_seconds
         self.similarity_threshold = similarity_threshold
         self._entries: list[CacheEntry] = []
+        self._lock = RLock()
 
     def get(self, query: str) -> tuple[str | None, float]:
-        best_value: str | None = None
-        best_score = 0.0
-        now = time.time()
-        self._entries = [e for e in self._entries if now - e.created_at <= self.ttl_seconds]
-        for entry in self._entries:
-            score = self.similarity(query, entry.key)
-            if score > best_score:
-                best_score = score
-                best_value = entry.value
-        if best_score >= self.similarity_threshold:
-            return best_value, best_score
-        return None, best_score
+        if _is_uncacheable(query):
+            return None, 0.0
+        with self._lock:
+            best_value: str | None = None
+            best_score = 0.0
+            best_key: str | None = None
+            now = time.time()
+            self._entries = [e for e in self._entries if now - e.created_at <= self.ttl_seconds]
+            for entry in self._entries:
+                if _looks_like_false_hit(query, entry.key):
+                    continue
+                score = self.similarity(query, entry.key)
+                if score > best_score:
+                    best_score = score
+                    best_value = entry.value
+                    best_key = entry.key
+            if best_key is not None and _looks_like_false_hit(query, best_key):
+                return None, best_score
+            if best_score >= self.similarity_threshold:
+                return best_value, best_score
+            return None, best_score
 
     def set(self, query: str, value: str, metadata: dict[str, str] | None = None) -> None:
-        self._entries.append(CacheEntry(query, value, time.time(), metadata or {}))
+        if _is_uncacheable(query):
+            return
+        with self._lock:
+            self._entries.append(CacheEntry(query, value, time.time(), metadata or {}))
 
     @staticmethod
     def similarity(a: str, b: str) -> float:
@@ -77,10 +107,12 @@ class ResponseCache:
 
         TODO(student): Improve with embeddings or a deterministic vectorizer.
         """
-        left = set(a.lower().split())
-        right = set(b.lower().split())
+        left = _normalized_tokens(a)
+        right = _normalized_tokens(b)
         if not left or not right:
             return 0.0
+        if left == right:
+            return 1.0
         return len(left & right) / len(left | right)
 
 
@@ -146,7 +178,38 @@ class SharedRedisCache:
         7. Before returning a match, check _looks_like_false_hit(); if true,
            append to self.false_hit_log and return (None, best_score)
         """
-        return None, 0.0
+        if _is_uncacheable(query):
+            return None, 0.0
+        try:
+            key = f"{self.prefix}{self._query_hash(query)}"
+            response = self._redis.hget(key, "response")
+            if isinstance(response, str):
+                return response, 1.0
+
+            best_response: str | None = None
+            best_query: str | None = None
+            best_score = 0.0
+            for redis_key in self._redis.scan_iter(f"{self.prefix}*"):
+                cached_query = self._redis.hget(redis_key, "query")
+                cached_response = self._redis.hget(redis_key, "response")
+                if not isinstance(cached_query, str) or not isinstance(cached_response, str):
+                    continue
+                score = ResponseCache.similarity(query, cached_query)
+                if score > best_score:
+                    best_score = score
+                    best_query = cached_query
+                    best_response = cached_response
+
+            if best_query is not None and _looks_like_false_hit(query, best_query):
+                self.false_hit_log.append(
+                    {"query": query, "cached_query": best_query, "score": best_score}
+                )
+                return None, best_score
+            if best_score >= self.similarity_threshold:
+                return best_response, best_score
+            return None, best_score
+        except Exception:
+            return None, 0.0
 
     def set(self, query: str, value: str, metadata: dict[str, str] | None = None) -> None:
         """Store a response in Redis with TTL.
@@ -157,7 +220,17 @@ class SharedRedisCache:
         3. self._redis.hset(key, mapping={"query": query, "response": value})
         4. self._redis.expire(key, self.ttl_seconds)
         """
-        pass
+        if _is_uncacheable(query):
+            return
+        try:
+            key = f"{self.prefix}{self._query_hash(query)}"
+            mapping = {"query": query, "response": value}
+            if metadata:
+                mapping["metadata"] = json.dumps(metadata, sort_keys=True)
+            self._redis.hset(key, mapping=mapping)
+            self._redis.expire(key, self.ttl_seconds)
+        except Exception:
+            return
 
     def flush(self) -> None:
         """Remove all entries with this cache prefix (for testing)."""
@@ -173,3 +246,7 @@ class SharedRedisCache:
     def _query_hash(query: str) -> str:
         """Deterministic short hash for a query string."""
         return hashlib.md5(query.lower().strip().encode()).hexdigest()[:12]
+
+
+def _normalized_tokens(text: str) -> set[str]:
+    return {token.lower() for token in TOKEN_PATTERN.findall(text) if token.lower() not in STOPWORDS}

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import csv
 from pathlib import Path
 from statistics import median
 from typing import Iterable
@@ -21,6 +22,7 @@ class RunMetrics(BaseModel):
     estimated_cost_saved: float = 0.0
     latencies_ms: list[float] = Field(default_factory=list)
     scenarios: dict[str, str] = Field(default_factory=dict)
+    cache_comparison: dict[str, dict[str, float]] = Field(default_factory=dict)
 
     @property
     def availability(self) -> float:
@@ -57,11 +59,24 @@ class RunMetrics(BaseModel):
             "estimated_cost": round(self.estimated_cost, 6),
             "estimated_cost_saved": round(self.estimated_cost_saved, 6),
             "scenarios": self.scenarios,
+            "cache_comparison": self.cache_comparison,
         }
 
     def write_json(self, path: str | Path) -> None:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         Path(path).write_text(json.dumps(self.to_report_dict(), indent=2, ensure_ascii=False))
+
+    def write_csv(self, path: str | Path) -> None:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        with Path(path).open("w", newline="") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(["metric", "value"])
+            for key, value in self.to_report_dict().items():
+                if key == "scenarios":
+                    continue
+                writer.writerow([key, value])
+            for key, value in self.scenarios.items():
+                writer.writerow([f"scenario.{key}", value])
 
 
 def percentile(values: Iterable[float], q: float) -> float:
